@@ -1,5 +1,4 @@
 import os
-import re
 import time
 import smtplib
 from datetime import datetime
@@ -58,365 +57,191 @@ def enviar_email():
     log("Email enviado.")
 
 
-def wait_visible_text(page, text: str, exact: bool = True, timeout: int = 30_000):
-    """
-    Busca un texto visible, evitando el problema de la DIAN donde existen
-    muchos nodos duplicados ocultos con el mismo texto.
+def _find_text_info(page, fragment: str):
+    return page.evaluate(
+        r"""
+        ({fragment}) => {
+          const wanted = (fragment || '').replace(/[.]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const normalize = (s) => (s || '').replace(/[.]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const isVisible = (el) => {
+            const r = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 &&
+                   style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
+                   style.opacity !== '0';
+          };
 
-    page.get_by_text(...).first puede apuntar a un <span> oculto. Por eso
-    iteramos los matches hasta encontrar uno realmente visible.
-    """
-    deadline = time.monotonic() + (timeout / 1000)
-    last_count = 0
+          const nodes = Array.from(document.querySelectorAll('body *'));
+          const matches = [];
 
-    while time.monotonic() < deadline:
-        locator = page.get_by_text(text, exact=exact)
+          for (const el of nodes) {
+            if (!isVisible(el)) continue;
+            const t = normalize(el.innerText || el.textContent || '');
+            if (!t || !t.includes(wanted)) continue;
+            const r = el.getBoundingClientRect();
+            const area = r.width * r.height;
+            // Ignorar contenedores gigantes como body/app-root, pero dejar tarjetas.
+            if (area > 500000) continue;
+            matches.push({
+              tag: el.tagName,
+              text: t.slice(0, 120),
+              x: Math.round(r.left + r.width / 2),
+              y: Math.round(r.top + r.height / 2),
+              width: Math.round(r.width),
+              height: Math.round(r.height),
+              area: Math.round(area),
+              className: (el.className || '').toString().slice(0, 120)
+            });
+          }
 
-        try:
-            last_count = locator.count()
-        except Exception:
-            last_count = 0
-
-        for index in range(min(last_count, 120)):
-            item = locator.nth(index)
-            try:
-                if item.is_visible(timeout=250):
-                    return item
-            except Exception:
-                pass
-
-        time.sleep(0.25)
-
-    raise PlaywrightTimeoutError(
-        f'No se encontró texto visible: {text}. Matches encontrados: {last_count}'
+          matches.sort((a, b) => a.area - b.area);
+          return {wanted, count: matches.length, first: matches.slice(0, 12)};
+        }
+        """,
+        {"fragment": fragment},
     )
 
 
-def _flexible_text_locator(page, text: str):
-    escaped = re.escape(text.replace(".", "")).replace("\\ ", r"\s+")
-    return page.get_by_text(re.compile(escaped, re.IGNORECASE)).first
+def wait_text_fragment(page, fragment: str, timeout: int = 60_000):
+    deadline = time.monotonic() + timeout / 1000
+    last = None
+    while time.monotonic() < deadline:
+        last = _find_text_info(page, fragment)
+        if last and last.get("count", 0) > 0:
+            return last
+        time.sleep(0.5)
+    raise PlaywrightTimeoutError(f"No apareció texto visible que contenga: {fragment}. Último resultado: {last}")
 
 
-def click_text(page, text: str, exact: bool = True, timeout: int = 30_000):
+def click_by_fragment(page, fragment: str, *, timeout: int = 30_000, prefer_card: bool = True):
     """
-    Click robusto por texto visible.
-    Si exact=True falla, intenta una búsqueda flexible con regex.
+    Click robusto por fragmento visible.
+
+    La UI de la DIAN tiene varios textos duplicados/ocultos, por eso NO usamos
+    get_by_text(...).first. Buscamos elementos visibles cuyo texto contenga el
+    fragmento y clickeamos el contenedor visible adecuado.
     """
-    log(f"Click en texto: {text}")
+    log(f"Click robusto por fragmento: {fragment}")
+    wait_text_fragment(page, fragment, timeout=timeout)
 
-    try:
-        locator = wait_visible_text(page, text, exact=exact, timeout=timeout)
-    except PlaywrightTimeoutError:
-        locator = _flexible_text_locator(page, text)
-        locator.wait_for(state="visible", timeout=timeout)
+    result = page.evaluate(
+        r"""
+        ({fragment, preferCard}) => {
+          const wanted = (fragment || '').replace(/[.]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const normalize = (s) => (s || '').replace(/[.]/g, '').replace(/\s+/g, ' ').trim().toLowerCase();
 
-    locator.scroll_into_view_if_needed(timeout=timeout)
-    locator.click(timeout=timeout)
+          const isVisible = (el) => {
+            const r = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 &&
+                   style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
+                   style.opacity !== '0';
+          };
 
+          const areaOf = (el) => {
+            const r = el.getBoundingClientRect();
+            return r.width * r.height;
+          };
 
-def esperar_pantalla_persona_natural(page, timeout: int = 40_000):
-    wait_visible_text(page, "Persona Natural", timeout=timeout)
+          const visibleTextNodes = Array.from(document.querySelectorAll('body *'))
+            .filter(el => {
+              if (!isVisible(el)) return false;
+              const t = normalize(el.innerText || el.textContent || '');
+              if (!t.includes(wanted)) return false;
+              const area = areaOf(el);
+              return area > 0 && area < 500000;
+            })
+            .sort((a, b) => areaOf(a) - areaOf(b));
 
+          if (!visibleTextNodes.length) {
+            return {ok: false, reason: 'visible fragment not found', wanted};
+          }
 
-def click_agendar_cita(page):
-    """
-    En la primera pantalla, el listener de Angular parece estar en la tarjeta
-    completa y además hay varios <span> ocultos con el texto "Agendar cita".
+          let base = visibleTextNodes[0];
+          let target = base;
 
-    Por eso NO hacemos wait sobre get_by_text("Agendar cita").first, porque
-    puede tomar un span oculto. Probamos primero coordenadas fijas sobre la
-    tarjeta, usando viewport 1366x900, y luego intentos por DOM/JS.
-    """
-    log("Click robusto en tarjeta: Agendar cita")
+          if (preferCard) {
+            // Subir desde el texto hasta una tarjeta/botón visible razonable.
+            let current = base;
+            for (let i = 0; current && i < 12; i++) {
+              const r = current.getBoundingClientRect();
+              const area = r.width * r.height;
+              const tag = current.tagName;
+              const role = current.getAttribute('role') || '';
+              const className = (current.className || '').toString().toLowerCase();
 
-    def wait_persona_natural_after_click():
-        esperar_pantalla_persona_natural(page, timeout=10_000)
-        log("Pantalla Persona Natural visible. Click Agendar cita funcionó.")
+              const looksClickable =
+                tag === 'BUTTON' || tag === 'A' || role === 'button' ||
+                className.includes('card') || className.includes('button') ||
+                className.includes('option') || className.includes('item') ||
+                className.includes('select');
 
-    def click_card_center():
-        # Coordenadas para viewport 1366x900. La tarjeta izquierda está aprox.
-        # entre x=341..716 y y=280..455. El centro cae en x=530, y=370.
-        log("Intentando click por coordenadas en el centro de la tarjeta")
-        page.mouse.click(530, 370)
+              const looksLikeCard = r.width >= 120 && r.height >= 70 && area < 250000;
 
-    def click_plus_icon():
-        # Click sobre el ícono + de la tarjeta.
-        log("Intentando click por coordenadas sobre el ícono +")
-        page.mouse.click(420, 365)
-
-    def click_visible_text_parent_by_js():
-        log("Intentando click por JavaScript sobre ancestro visible")
-        result = page.evaluate(
-            """
-            () => {
-              const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim();
-              const nodes = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, b, strong'));
-
-              const isVisible = (el) => {
-                const r = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                return r.width > 0 && r.height > 0 &&
-                       style.display !== 'none' &&
-                       style.visibility !== 'hidden' &&
-                       style.opacity !== '0';
-              };
-
-              const el = nodes.find(n => normalize(n.innerText || n.textContent) === 'Agendar cita' && isVisible(n));
-              if (!el) {
-                return {ok: false, reason: 'visible text node not found'};
+              if (isVisible(current) && (looksClickable || looksLikeCard)) {
+                target = current;
+                break;
               }
-
-              let current = el;
-              for (let i = 0; current && i < 10; i++) {
-                const r = current.getBoundingClientRect();
-                // Buscar una tarjeta grande clickeable.
-                if (r.width >= 250 && r.height >= 120) {
-                  current.dispatchEvent(new MouseEvent('click', {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    clientX: r.left + r.width / 2,
-                    clientY: r.top + r.height / 2
-                  }));
-                  current.click();
-                  return {ok: true, clicked: current.tagName, className: current.className || ''};
-                }
-                current = current.parentElement;
-              }
-
-              el.click();
-              return {ok: true, clicked: el.tagName, className: el.className || ''};
+              current = current.parentElement;
             }
-            """
-        )
-        log(f"Resultado JS Agendar cita: {result}")
-        if not result or not result.get("ok"):
-            raise DianCheckerError(f"JS no encontró tarjeta visible: {result}")
+          }
 
-    def click_visible_text_locator():
-        log("Intentando click sobre texto visible Agendar cita")
-        locator = wait_visible_text(page, "Agendar cita", timeout=8_000)
-        locator.scroll_into_view_if_needed(timeout=5_000)
-        locator.click(force=True, timeout=5_000)
+          const r = target.getBoundingClientRect();
+          const x = r.left + r.width / 2;
+          const y = r.top + r.height / 2;
 
-    attempts = [
-        click_card_center,
-        click_plus_icon,
-        click_visible_text_parent_by_js,
-        click_visible_text_locator,
-    ]
+          target.scrollIntoView({block: 'center', inline: 'center'});
 
-    last_error = None
-    for index, attempt in enumerate(attempts, start=1):
-        try:
-            log(f"Intento {index} para abrir Agendar cita")
-            attempt()
-            wait_persona_natural_after_click()
-            return
-        except Exception as e:
-            last_error = e
-            log(f"Intento {index} no cambió de pantalla: {repr(e)}")
-            screenshot(page, f"dian_agendar_intento_{index}.png")
+          const events = ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+          for (const type of events) {
+            target.dispatchEvent(new MouseEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+              clientX: x,
+              clientY: y
+            }));
+          }
 
-    raise DianCheckerError(f"No se pudo pasar de Agendar cita. Último error: {repr(last_error)}")
+          if (typeof target.click === 'function') target.click();
 
-def _normalize_js_text(text: str) -> str:
-    return " ".join(text.replace(".", "").split()).strip().lower()
+          return {
+            ok: true,
+            wanted,
+            clickedTag: target.tagName,
+            clickedText: normalize(target.innerText || target.textContent || '').slice(0, 150),
+            x: Math.round(x),
+            y: Math.round(y),
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+            className: (target.className || '').toString().slice(0, 120)
+          };
+        }
+        """,
+        {"fragment": fragment, "preferCard": prefer_card},
+    )
 
+    log(f"Resultado click fragmento {fragment}: {result}")
+    if not result or not result.get("ok"):
+        raise DianCheckerError(f"No se pudo clickear fragmento {fragment}: {result}")
 
-def click_card_by_text(page, text: str, *, exact: bool = True, timeout: int = 30_000):
-    """
-    Click robusto para tarjetas tipo:
-    - Persona Natural
-    - Videoatención
-    - Devoluciones.
-
-    La DIAN suele tener textos duplicados ocultos y a veces el listener está
-    en la tarjeta padre, no en el texto. Por eso se intenta:
-    1. Click por JS sobre el ancestro visible grande.
-    2. Click por locator visible del texto.
-    3. Click por coordenadas del bounding box del ancestro.
-    """
-    log(f"Click robusto en tarjeta: {text}")
-
-    wanted = _normalize_js_text(text)
-    text_without_dot = text.replace(".", "")
-
-    def js_click_card():
-        result = page.evaluate(
-            """
-            ({wanted, exact}) => {
-              const normalize = (s) => (s || '')
-                .replace(/[.]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .toLowerCase();
-
-              const isVisible = (el) => {
-                const r = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                return r.width > 0 && r.height > 0 &&
-                       style.display !== 'none' &&
-                       style.visibility !== 'hidden' &&
-                       style.opacity !== '0';
-              };
-
-              const matches = (el) => {
-                const t = normalize(el.innerText || el.textContent || '');
-                if (!t) return false;
-                return exact ? t === wanted : t.includes(wanted);
-              };
-
-              const nodes = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, b, strong, button'));
-              const textNode = nodes.find(n => matches(n) && isVisible(n));
-
-              if (!textNode) {
-                return {ok: false, reason: 'visible text node not found', wanted};
-              }
-
-              let best = textNode;
-              let current = textNode;
-
-              for (let i = 0; current && i < 12; i++) {
-                const r = current.getBoundingClientRect();
-                const style = window.getComputedStyle(current);
-
-                // Preferimos la tarjeta grande, no el span interno.
-                const looksLikeCard = r.width >= 120 && r.height >= 80;
-                const clickable =
-                  current.tagName === 'BUTTON' ||
-                  current.getAttribute('role') === 'button' ||
-                  style.cursor === 'pointer' ||
-                  looksLikeCard;
-
-                if (clickable && isVisible(current)) {
-                  best = current;
-
-                  if (looksLikeCard) {
-                    break;
-                  }
-                }
-
-                current = current.parentElement;
-              }
-
-              const r = best.getBoundingClientRect();
-              const x = r.left + r.width / 2;
-              const y = r.top + r.height / 2;
-
-              best.scrollIntoView({block: 'center', inline: 'center'});
-              best.dispatchEvent(new MouseEvent('mouseover', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-              best.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-              best.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-              best.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-
-              if (typeof best.click === 'function') {
-                best.click();
-              }
-
-              return {
-                ok: true,
-                clickedTag: best.tagName,
-                clickedText: normalize(best.innerText || best.textContent || '').slice(0, 120),
-                width: Math.round(r.width),
-                height: Math.round(r.height),
-                x: Math.round(x),
-                y: Math.round(y)
-              };
-            }
-            """,
-            {"wanted": wanted, "exact": exact},
-        )
-        log(f"Resultado JS tarjeta {text}: {result}")
-        if not result or not result.get("ok"):
-            raise DianCheckerError(f"JS no pudo clickear tarjeta {text}: {result}")
-
-    def locator_click():
-        locator = wait_visible_text(page, text_without_dot if not exact else text, exact=exact, timeout=8_000)
-        locator.scroll_into_view_if_needed(timeout=5_000)
-        locator.click(force=True, timeout=5_000)
-
-    def coordinate_click_from_text():
-        # Último recurso: ubica el texto visible y hace click al centro del
-        # rectángulo de un ancestro grande.
-        box = page.evaluate(
-            """
-            ({wanted, exact}) => {
-              const normalize = (s) => (s || '')
-                .replace(/[.]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .toLowerCase();
-
-              const isVisible = (el) => {
-                const r = el.getBoundingClientRect();
-                const style = window.getComputedStyle(el);
-                return r.width > 0 && r.height > 0 &&
-                       style.display !== 'none' &&
-                       style.visibility !== 'hidden' &&
-                       style.opacity !== '0';
-              };
-
-              const nodes = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, b, strong, button'));
-              const el = nodes.find(n => {
-                const t = normalize(n.innerText || n.textContent || '');
-                return isVisible(n) && (exact ? t === wanted : t.includes(wanted));
-              });
-              if (!el) return null;
-
-              let current = el;
-              let best = el;
-              for (let i = 0; current && i < 12; i++) {
-                const r = current.getBoundingClientRect();
-                if (r.width >= 120 && r.height >= 80 && isVisible(current)) {
-                  best = current;
-                  break;
-                }
-                current = current.parentElement;
-              }
-
-              const r = best.getBoundingClientRect();
-              return {x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height};
-            }
-            """,
-            {"wanted": wanted, "exact": exact},
-        )
-
-        if not box:
-            raise DianCheckerError(f"No se encontró bounding box para {text}")
-
-        log(f"Click por coordenadas en tarjeta {text}: {box}")
-        page.mouse.click(box["x"], box["y"])
-
-    attempts = [js_click_card, locator_click, coordinate_click_from_text]
-    last_error = None
-
-    for index, attempt in enumerate(attempts, start=1):
-        try:
-            attempt()
-            page.wait_for_timeout(700)
-            return
-        except Exception as e:
-            last_error = e
-            log(f"Intento {index} falló para tarjeta {text}: {repr(e)}")
-            screenshot(page, f"dian_click_{_normalize_js_text(text).replace(' ', '_')}_intento_{index}.png")
-
-    raise DianCheckerError(f"No se pudo clickear tarjeta {text}. Último error: {repr(last_error)}")
+    page.wait_for_timeout(900)
+    return result
 
 
 def click_siguiente(page, timeout: int = 30_000):
-    """Click robusto en el botón Siguiente, esperando que esté visible y habilitado."""
+    """Click robusto en Siguiente, esperando que esté habilitado."""
     log("Click robusto en botón: Siguiente")
-
-    deadline = time.monotonic() + (timeout / 1000)
-    last_result = None
+    deadline = time.monotonic() + timeout / 1000
+    last = None
 
     while time.monotonic() < deadline:
         result = page.evaluate(
-            """
+            r"""
             () => {
               const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-
               const isVisible = (el) => {
                 const r = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
@@ -425,25 +250,22 @@ def click_siguiente(page, timeout: int = 30_000):
                        style.visibility !== 'hidden' &&
                        style.opacity !== '0';
               };
-
               const isDisabled = (el) => {
+                const cls = (el.className || '').toString().toLowerCase();
                 return el.disabled === true ||
                        el.getAttribute('disabled') !== null ||
                        el.getAttribute('aria-disabled') === 'true' ||
-                       (el.className || '').toString().toLowerCase().includes('disabled');
+                       cls.includes('disabled') || cls.includes('disable');
               };
 
-              const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, span, div'));
-              const node = nodes.find(n => normalize(n.innerText || n.textContent || '') === 'siguiente' && isVisible(n));
+              const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], div, span'));
+              const matches = nodes.filter(el => isVisible(el) && normalize(el.innerText || el.textContent || '') === 'siguiente');
+              if (!matches.length) return {ok: false, reason: 'not_found'};
 
-              if (!node) {
-                return {ok: false, reason: 'button text not found'};
-              }
-
-              let target = node;
-              let current = node;
+              let target = matches[0];
+              let current = target;
               for (let i = 0; current && i < 8; i++) {
-                if ((current.tagName === 'BUTTON' || current.getAttribute('role') === 'button' || current.tagName === 'A') && isVisible(current)) {
+                if ((current.tagName === 'BUTTON' || current.tagName === 'A' || current.getAttribute('role') === 'button') && isVisible(current)) {
                   target = current;
                   break;
                 }
@@ -451,102 +273,94 @@ def click_siguiente(page, timeout: int = 30_000):
               }
 
               if (isDisabled(target)) {
-                return {ok: false, reason: 'button disabled', tag: target.tagName, className: target.className || ''};
+                return {ok: false, reason: 'disabled', tag: target.tagName, className: target.className || ''};
               }
 
               const r = target.getBoundingClientRect();
               const x = r.left + r.width / 2;
               const y = r.top + r.height / 2;
-
               target.scrollIntoView({block: 'center', inline: 'center'});
-              target.dispatchEvent(new MouseEvent('mouseover', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-              target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-              target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-              target.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
-
-              if (typeof target.click === 'function') {
-                target.click();
+              const events = ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+              for (const type of events) {
+                target.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
               }
-
+              if (typeof target.click === 'function') target.click();
               return {ok: true, tag: target.tagName, x: Math.round(x), y: Math.round(y), className: target.className || ''};
             }
             """
         )
-        last_result = result
-
+        last = result
         if result and result.get("ok"):
-            log(f"Resultado botón Siguiente: {result}")
-            page.wait_for_timeout(900)
+            log(f"Resultado Siguiente: {result}")
+            page.wait_for_timeout(1200)
             return
+        time.sleep(0.5)
 
-        time.sleep(0.4)
-
-    raise DianCheckerError(f"No se pudo clickear Siguiente. Último resultado: {last_result}")
+    raise DianCheckerError(f"No se pudo clickear Siguiente. Último resultado: {last}")
 
 
-def click_siguiente_if_available(page, timeout: int = 5_000) -> bool:
-    """Intenta Siguiente si existe y está habilitado; si no, continúa sin fallar."""
+def click_siguiente_if_available(page, timeout: int = 5_000):
     try:
         click_siguiente(page, timeout=timeout)
         return True
     except Exception as e:
-        log(f"No se hizo click en Siguiente opcional: {repr(e)}")
+        log(f"Siguiente opcional no disponible o no requerido: {repr(e)}")
         return False
 
 
-def wait_until_any_visible(page, texts, timeout: int = 30_000):
-    deadline = time.monotonic() + (timeout / 1000)
-    last_error = None
-
+def wait_any_fragment(page, fragments, timeout: int = 40_000):
+    deadline = time.monotonic() + timeout / 1000
+    last = None
     while time.monotonic() < deadline:
-        for text in texts:
-            try:
-                return text, wait_visible_text(page, text, exact=False, timeout=1_500)
-            except Exception as e:
-                last_error = e
-        time.sleep(0.25)
+        for fragment in fragments:
+            info = _find_text_info(page, fragment)
+            last = info
+            if info and info.get("count", 0) > 0:
+                log(f"Pantalla detectada por texto: {fragment}")
+                return fragment
+        time.sleep(0.5)
+    raise PlaywrightTimeoutError(f"No apareció ninguno de estos textos: {fragments}. Último resultado: {last}")
 
-    raise PlaywrightTimeoutError(f"No apareció ninguno de estos textos: {texts}. Último error: {repr(last_error)}")
+
+def dump_visible_matches(page, label: str, fragments):
+    """Diagnóstico liviano para ver qué textos detecta Playwright/JS."""
+    log(f"Dump visible matches: {label}")
+    for fragment in fragments:
+        try:
+            info = _find_text_info(page, fragment)
+            log(f"Fragmento '{fragment}': {info}")
+        except Exception as e:
+            log(f"No se pudo inspeccionar fragmento {fragment}: {repr(e)}")
 
 
 def aplicar_filtros(page):
-    """
-    Flujo actualizado con stepper:
+    # La página es SPA: domcontentloaded ocurre antes de que cargue la UI real.
+    # Por eso primero esperamos la pantalla inicial y solo después tomamos screenshot/click.
+    wait_any_fragment(page, ["Agendar cita", "Gestionar cita"], timeout=90_000)
+    screenshot(page, "dian_01_inicio_cargado.png")
+    dump_visible_matches(page, "inicio", ["Agendar cita", "Programe cita", "Gestionar cita"])
 
-    1. Agendar cita
-    2. Persona Natural
-    3. Siguiente
-    4. Videoatención
-    5. Siguiente
-    6. Devoluciones.
-    7. Siguiente opcional, si la UI lo exige antes de mostrar el modal.
-    """
+    click_by_fragment(page, "Agendar cita", timeout=30_000, prefer_card=True)
+    wait_any_fragment(page, ["Persona Natural", "Persona Jurídica", "Seleccione el tipo de persona"], timeout=60_000)
+    screenshot(page, "dian_02_paso_persona.png")
 
-    screenshot(page, "dian_01_inicio.png")
-
-    click_agendar_cita(page)
-    screenshot(page, "dian_02_agendar_cita.png")
-
-    click_card_by_text(page, "Persona Natural")
-    screenshot(page, "dian_03_persona_natural_seleccionada.png")
-
+    click_by_fragment(page, "Persona Natural", timeout=30_000, prefer_card=True)
+    screenshot(page, "dian_03_persona_natural_click.png")
     click_siguiente(page)
-    wait_until_any_visible(page, ["Videoatención", "Presencial", "Seleccione cómo prefiere", "¿Cómo prefiere la cita?"], timeout=40_000)
+
+    wait_any_fragment(page, ["Videoatención", "Presencial", "Cómo prefiere", "¿Cómo prefiere la cita?"], timeout=60_000)
     screenshot(page, "dian_04_paso_tipo_cita.png")
 
-    click_card_by_text(page, "Videoatención")
-    screenshot(page, "dian_05_videoatencion_seleccionada.png")
-
+    click_by_fragment(page, "Videoatención", timeout=30_000, prefer_card=True)
+    screenshot(page, "dian_05_videoatencion_click.png")
     click_siguiente(page)
-    wait_until_any_visible(page, ["Devoluciones", "RUT y orientación", "Seleccione el tipo de servicio"], timeout=40_000)
+
+    wait_any_fragment(page, ["Devoluciones", "RUT y orientación", "Seleccione el tipo de servicio"], timeout=60_000)
     screenshot(page, "dian_06_paso_servicio.png")
 
-    click_card_by_text(page, "Devoluciones.", exact=False)
-    screenshot(page, "dian_07_devoluciones_seleccionada.png")
-
-    # En algunas versiones de la UI, seleccionar Devoluciones abre el modal directamente.
-    # En otras, primero habilita Siguiente. Probamos sin romper el flujo.
-    click_siguiente_if_available(page, timeout=5_000)
+    click_by_fragment(page, "Devoluciones", timeout=30_000, prefer_card=True)
+    screenshot(page, "dian_07_devoluciones_click.png")
+    click_siguiente_if_available(page, timeout=8_000)
     screenshot(page, "dian_08_despues_devoluciones.png")
 
 
@@ -575,18 +389,12 @@ def revisar_dian() -> str:
             aplicar_filtros(page)
 
             try:
-                page.get_by_text(NO_DISPONIBLE_TEXT).wait_for(
-                    state="visible",
-                    timeout=30_000,
-                )
-
+                page.get_by_text(NO_DISPONIBLE_TEXT).wait_for(state="visible", timeout=30_000)
                 log("Sin citas disponibles. Apareció el mensaje esperado.")
                 screenshot(page, "dian_sin_citas.png")
                 return "sin_citas"
-
             except PlaywrightTimeoutError:
                 body_text = page.locator("body").inner_text(timeout=10_000)
-
                 if NO_DISPONIBLE_TEXT in body_text:
                     log("Sin citas disponibles. El texto apareció en el body.")
                     screenshot(page, "dian_sin_citas.png")
@@ -600,14 +408,12 @@ def revisar_dian() -> str:
             log(f"Error revisando DIAN: {repr(e)}")
             screenshot(page, "dian_error.png")
             raise
-
         finally:
             browser.close()
 
 
 def main():
     status = revisar_dian()
-
     if status == "posible_disponibilidad":
         enviar_email()
     else:
