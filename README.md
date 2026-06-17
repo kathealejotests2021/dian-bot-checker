@@ -65,6 +65,21 @@ Ve a:
 `Actions` → `DIAN citas checker` → `Disable workflow`
 
 
-## v4
+## v5
 
 Esta versión corrige el caso en el que `get_by_text("Agendar cita").first` apunta a un `<span>` oculto. Ahora intenta primero coordenadas sobre la tarjeta y usa una búsqueda que ignora nodos ocultos.
+
+
+## v5
+
+Esta versión agrega clicks robustos para las tarjetas `Persona Natural`, `Videoatención`, `Devoluciones.` y el botón `Siguiente`.
+
+Flujo actual:
+
+1. Agendar cita
+2. Persona Natural
+3. Siguiente
+4. Videoatención
+5. Siguiente
+6. Devoluciones.
+7. Siguiente opcional si la UI lo exige

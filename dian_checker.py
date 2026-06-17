@@ -220,16 +220,306 @@ def click_agendar_cita(page):
 
     raise DianCheckerError(f"No se pudo pasar de Agendar cita. Último error: {repr(last_error)}")
 
+def _normalize_js_text(text: str) -> str:
+    return " ".join(text.replace(".", "").split()).strip().lower()
+
+
+def click_card_by_text(page, text: str, *, exact: bool = True, timeout: int = 30_000):
+    """
+    Click robusto para tarjetas tipo:
+    - Persona Natural
+    - Videoatención
+    - Devoluciones.
+
+    La DIAN suele tener textos duplicados ocultos y a veces el listener está
+    en la tarjeta padre, no en el texto. Por eso se intenta:
+    1. Click por JS sobre el ancestro visible grande.
+    2. Click por locator visible del texto.
+    3. Click por coordenadas del bounding box del ancestro.
+    """
+    log(f"Click robusto en tarjeta: {text}")
+
+    wanted = _normalize_js_text(text)
+    text_without_dot = text.replace(".", "")
+
+    def js_click_card():
+        result = page.evaluate(
+            """
+            ({wanted, exact}) => {
+              const normalize = (s) => (s || '')
+                .replace(/[.]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       style.opacity !== '0';
+              };
+
+              const matches = (el) => {
+                const t = normalize(el.innerText || el.textContent || '');
+                if (!t) return false;
+                return exact ? t === wanted : t.includes(wanted);
+              };
+
+              const nodes = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, b, strong, button'));
+              const textNode = nodes.find(n => matches(n) && isVisible(n));
+
+              if (!textNode) {
+                return {ok: false, reason: 'visible text node not found', wanted};
+              }
+
+              let best = textNode;
+              let current = textNode;
+
+              for (let i = 0; current && i < 12; i++) {
+                const r = current.getBoundingClientRect();
+                const style = window.getComputedStyle(current);
+
+                // Preferimos la tarjeta grande, no el span interno.
+                const looksLikeCard = r.width >= 120 && r.height >= 80;
+                const clickable =
+                  current.tagName === 'BUTTON' ||
+                  current.getAttribute('role') === 'button' ||
+                  style.cursor === 'pointer' ||
+                  looksLikeCard;
+
+                if (clickable && isVisible(current)) {
+                  best = current;
+
+                  if (looksLikeCard) {
+                    break;
+                  }
+                }
+
+                current = current.parentElement;
+              }
+
+              const r = best.getBoundingClientRect();
+              const x = r.left + r.width / 2;
+              const y = r.top + r.height / 2;
+
+              best.scrollIntoView({block: 'center', inline: 'center'});
+              best.dispatchEvent(new MouseEvent('mouseover', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+              best.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+              best.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+              best.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+
+              if (typeof best.click === 'function') {
+                best.click();
+              }
+
+              return {
+                ok: true,
+                clickedTag: best.tagName,
+                clickedText: normalize(best.innerText || best.textContent || '').slice(0, 120),
+                width: Math.round(r.width),
+                height: Math.round(r.height),
+                x: Math.round(x),
+                y: Math.round(y)
+              };
+            }
+            """,
+            {"wanted": wanted, "exact": exact},
+        )
+        log(f"Resultado JS tarjeta {text}: {result}")
+        if not result or not result.get("ok"):
+            raise DianCheckerError(f"JS no pudo clickear tarjeta {text}: {result}")
+
+    def locator_click():
+        locator = wait_visible_text(page, text_without_dot if not exact else text, exact=exact, timeout=8_000)
+        locator.scroll_into_view_if_needed(timeout=5_000)
+        locator.click(force=True, timeout=5_000)
+
+    def coordinate_click_from_text():
+        # Último recurso: ubica el texto visible y hace click al centro del
+        # rectángulo de un ancestro grande.
+        box = page.evaluate(
+            """
+            ({wanted, exact}) => {
+              const normalize = (s) => (s || '')
+                .replace(/[.]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       style.opacity !== '0';
+              };
+
+              const nodes = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, b, strong, button'));
+              const el = nodes.find(n => {
+                const t = normalize(n.innerText || n.textContent || '');
+                return isVisible(n) && (exact ? t === wanted : t.includes(wanted));
+              });
+              if (!el) return null;
+
+              let current = el;
+              let best = el;
+              for (let i = 0; current && i < 12; i++) {
+                const r = current.getBoundingClientRect();
+                if (r.width >= 120 && r.height >= 80 && isVisible(current)) {
+                  best = current;
+                  break;
+                }
+                current = current.parentElement;
+              }
+
+              const r = best.getBoundingClientRect();
+              return {x: r.left + r.width / 2, y: r.top + r.height / 2, width: r.width, height: r.height};
+            }
+            """,
+            {"wanted": wanted, "exact": exact},
+        )
+
+        if not box:
+            raise DianCheckerError(f"No se encontró bounding box para {text}")
+
+        log(f"Click por coordenadas en tarjeta {text}: {box}")
+        page.mouse.click(box["x"], box["y"])
+
+    attempts = [js_click_card, locator_click, coordinate_click_from_text]
+    last_error = None
+
+    for index, attempt in enumerate(attempts, start=1):
+        try:
+            attempt()
+            page.wait_for_timeout(700)
+            return
+        except Exception as e:
+            last_error = e
+            log(f"Intento {index} falló para tarjeta {text}: {repr(e)}")
+            screenshot(page, f"dian_click_{_normalize_js_text(text).replace(' ', '_')}_intento_{index}.png")
+
+    raise DianCheckerError(f"No se pudo clickear tarjeta {text}. Último error: {repr(last_error)}")
+
+
+def click_siguiente(page, timeout: int = 30_000):
+    """Click robusto en el botón Siguiente, esperando que esté visible y habilitado."""
+    log("Click robusto en botón: Siguiente")
+
+    deadline = time.monotonic() + (timeout / 1000)
+    last_result = None
+
+    while time.monotonic() < deadline:
+        result = page.evaluate(
+            """
+            () => {
+              const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       style.opacity !== '0';
+              };
+
+              const isDisabled = (el) => {
+                return el.disabled === true ||
+                       el.getAttribute('disabled') !== null ||
+                       el.getAttribute('aria-disabled') === 'true' ||
+                       (el.className || '').toString().toLowerCase().includes('disabled');
+              };
+
+              const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, span, div'));
+              const node = nodes.find(n => normalize(n.innerText || n.textContent || '') === 'siguiente' && isVisible(n));
+
+              if (!node) {
+                return {ok: false, reason: 'button text not found'};
+              }
+
+              let target = node;
+              let current = node;
+              for (let i = 0; current && i < 8; i++) {
+                if ((current.tagName === 'BUTTON' || current.getAttribute('role') === 'button' || current.tagName === 'A') && isVisible(current)) {
+                  target = current;
+                  break;
+                }
+                current = current.parentElement;
+              }
+
+              if (isDisabled(target)) {
+                return {ok: false, reason: 'button disabled', tag: target.tagName, className: target.className || ''};
+              }
+
+              const r = target.getBoundingClientRect();
+              const x = r.left + r.width / 2;
+              const y = r.top + r.height / 2;
+
+              target.scrollIntoView({block: 'center', inline: 'center'});
+              target.dispatchEvent(new MouseEvent('mouseover', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+              target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+              target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+              target.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window, clientX: x, clientY: y}));
+
+              if (typeof target.click === 'function') {
+                target.click();
+              }
+
+              return {ok: true, tag: target.tagName, x: Math.round(x), y: Math.round(y), className: target.className || ''};
+            }
+            """
+        )
+        last_result = result
+
+        if result and result.get("ok"):
+            log(f"Resultado botón Siguiente: {result}")
+            page.wait_for_timeout(900)
+            return
+
+        time.sleep(0.4)
+
+    raise DianCheckerError(f"No se pudo clickear Siguiente. Último resultado: {last_result}")
+
+
+def click_siguiente_if_available(page, timeout: int = 5_000) -> bool:
+    """Intenta Siguiente si existe y está habilitado; si no, continúa sin fallar."""
+    try:
+        click_siguiente(page, timeout=timeout)
+        return True
+    except Exception as e:
+        log(f"No se hizo click en Siguiente opcional: {repr(e)}")
+        return False
+
+
+def wait_until_any_visible(page, texts, timeout: int = 30_000):
+    deadline = time.monotonic() + (timeout / 1000)
+    last_error = None
+
+    while time.monotonic() < deadline:
+        for text in texts:
+            try:
+                return text, wait_visible_text(page, text, exact=False, timeout=1_500)
+            except Exception as e:
+                last_error = e
+        time.sleep(0.25)
+
+    raise PlaywrightTimeoutError(f"No apareció ninguno de estos textos: {texts}. Último error: {repr(last_error)}")
+
+
 def aplicar_filtros(page):
     """
-    Flujo según las capturas compartidas:
+    Flujo actualizado con stepper:
 
     1. Agendar cita
     2. Persona Natural
-    3. Videoatención
-    4. Devoluciones.
-
-    Si la DIAN cambia el texto o agrega campos adicionales, ajusta aquí.
+    3. Siguiente
+    4. Videoatención
+    5. Siguiente
+    6. Devoluciones.
+    7. Siguiente opcional, si la UI lo exige antes de mostrar el modal.
     """
 
     screenshot(page, "dian_01_inicio.png")
@@ -237,17 +527,27 @@ def aplicar_filtros(page):
     click_agendar_cita(page)
     screenshot(page, "dian_02_agendar_cita.png")
 
-    click_text(page, "Persona Natural")
-    wait_visible_text(page, "Videoatención", timeout=30_000)
-    screenshot(page, "dian_03_persona_natural.png")
+    click_card_by_text(page, "Persona Natural")
+    screenshot(page, "dian_03_persona_natural_seleccionada.png")
 
-    click_text(page, "Videoatención")
-    wait_visible_text(page, "Devoluciones.", exact=False, timeout=30_000)
-    screenshot(page, "dian_04_videoatencion.png")
+    click_siguiente(page)
+    wait_until_any_visible(page, ["Videoatención", "Presencial", "Seleccione cómo prefiere", "¿Cómo prefiere la cita?"], timeout=40_000)
+    screenshot(page, "dian_04_paso_tipo_cita.png")
 
-    # En algunos navegadores el punto final puede romper el exact match.
-    click_text(page, "Devoluciones.", exact=False)
-    screenshot(page, "dian_05_despues_devoluciones.png")
+    click_card_by_text(page, "Videoatención")
+    screenshot(page, "dian_05_videoatencion_seleccionada.png")
+
+    click_siguiente(page)
+    wait_until_any_visible(page, ["Devoluciones", "RUT y orientación", "Seleccione el tipo de servicio"], timeout=40_000)
+    screenshot(page, "dian_06_paso_servicio.png")
+
+    click_card_by_text(page, "Devoluciones.", exact=False)
+    screenshot(page, "dian_07_devoluciones_seleccionada.png")
+
+    # En algunas versiones de la UI, seleccionar Devoluciones abre el modal directamente.
+    # En otras, primero habilita Siguiente. Probamos sin romper el flujo.
+    click_siguiente_if_available(page, timeout=5_000)
+    screenshot(page, "dian_08_despues_devoluciones.png")
 
 
 def revisar_dian() -> str:
