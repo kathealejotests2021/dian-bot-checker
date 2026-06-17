@@ -1,20 +1,19 @@
 name: DIAN citas checker
 
 on:
-  workflow_dispatch:
-
+  workflow_dispatch: # Te permite ejecutarlo manualmente desde la pestaña Actions
   schedule:
-    # Cada 5 minutos de 08:00 a 18:55 Colombia
+    # Cada 5 minutos de 08:00 a 18:55 Colombia (13:00 a 23:55 UTC)
     - cron: "*/5 13-23 * * *"
-
-    # Última revisión a las 19:00 Colombia
+    
+    # Última revisión a las 19:00 Colombia (00:00 UTC del día siguiente)
+    # Nota: Si en Colombia son las 19:00, en UTC ya es la medianoche (00:00)
     - cron: "0 0 * * *"
 
 jobs:
   check-dian:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
