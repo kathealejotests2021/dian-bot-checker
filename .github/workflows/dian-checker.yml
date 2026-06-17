@@ -1,0 +1,46 @@
+name: DIAN citas checker
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Colombia es UTC-5.
+    # 13-23 UTC equivale a 08:00-18:40 Colombia.
+    - cron: "*/20 13-23 * * *"
+
+    # 00:00 UTC equivale a 19:00 Colombia del día anterior.
+    - cron: "0 0 * * *"
+
+jobs:
+  check-dian:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Check DIAN appointments
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python dian_checker.py
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dian-screenshots
+          path: dian_*.png
+          if-no-files-found: ignore
