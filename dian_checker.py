@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -58,9 +59,37 @@ def enviar_email():
 
 
 def wait_visible_text(page, text: str, exact: bool = True, timeout: int = 30_000):
-    locator = page.get_by_text(text, exact=exact).first
-    locator.wait_for(state="visible", timeout=timeout)
-    return locator
+    """
+    Busca un texto visible, evitando el problema de la DIAN donde existen
+    muchos nodos duplicados ocultos con el mismo texto.
+
+    page.get_by_text(...).first puede apuntar a un <span> oculto. Por eso
+    iteramos los matches hasta encontrar uno realmente visible.
+    """
+    deadline = time.monotonic() + (timeout / 1000)
+    last_count = 0
+
+    while time.monotonic() < deadline:
+        locator = page.get_by_text(text, exact=exact)
+
+        try:
+            last_count = locator.count()
+        except Exception:
+            last_count = 0
+
+        for index in range(min(last_count, 120)):
+            item = locator.nth(index)
+            try:
+                if item.is_visible(timeout=250):
+                    return item
+            except Exception:
+                pass
+
+        time.sleep(0.25)
+
+    raise PlaywrightTimeoutError(
+        f'No se encontró texto visible: {text}. Matches encontrados: {last_count}'
+    )
 
 
 def _flexible_text_locator(page, text: str):
@@ -91,66 +120,98 @@ def esperar_pantalla_persona_natural(page, timeout: int = 40_000):
 
 def click_agendar_cita(page):
     """
-    En la primera pantalla, el click directo sobre el texto 'Agendar cita'
-    a veces no dispara la navegación porque el listener está en la tarjeta.
-    Por eso se intenta:
-      1. Click normal sobre el texto.
-      2. Click en el centro aproximado de la tarjeta, calculado desde el texto.
-      3. Click JS sobre los ancestros del texto.
+    En la primera pantalla, el listener de Angular parece estar en la tarjeta
+    completa y además hay varios <span> ocultos con el texto "Agendar cita".
+
+    Por eso NO hacemos wait sobre get_by_text("Agendar cita").first, porque
+    puede tomar un span oculto. Probamos primero coordenadas fijas sobre la
+    tarjeta, usando viewport 1366x900, y luego intentos por DOM/JS.
     """
     log("Click robusto en tarjeta: Agendar cita")
 
-    locator = wait_visible_text(page, "Agendar cita", timeout=40_000)
-    locator.scroll_into_view_if_needed(timeout=10_000)
+    def wait_persona_natural_after_click():
+        esperar_pantalla_persona_natural(page, timeout=10_000)
+        log("Pantalla Persona Natural visible. Click Agendar cita funcionó.")
 
-    def normal_click():
-        locator.click(timeout=10_000)
+    def click_card_center():
+        # Coordenadas para viewport 1366x900. La tarjeta izquierda está aprox.
+        # entre x=341..716 y y=280..455. El centro cae en x=530, y=370.
+        log("Intentando click por coordenadas en el centro de la tarjeta")
+        page.mouse.click(530, 370)
 
-    def card_mouse_click():
-        box = locator.bounding_box(timeout=10_000)
-        if not box:
-            raise DianCheckerError("No se pudo obtener bounding box de Agendar cita")
+    def click_plus_icon():
+        # Click sobre el ícono + de la tarjeta.
+        log("Intentando click por coordenadas sobre el ícono +")
+        page.mouse.click(420, 365)
 
-        # En la tarjeta, el icono + está a la izquierda del texto. Un click allí
-        # suele disparar el evento de la tarjeta completa.
-        x = max(box["x"] - 120, 10)
-        y = box["y"] + 45
-        log(f"Click por coordenadas en tarjeta Agendar cita: x={x:.0f}, y={y:.0f}")
-        page.mouse.click(x, y)
-
-    def js_ancestor_click():
-        page.evaluate(
+    def click_visible_text_parent_by_js():
+        log("Intentando click por JavaScript sobre ancestro visible")
+        result = page.evaluate(
             """
             () => {
-              const nodes = Array.from(document.querySelectorAll('*'));
-              const el = nodes.find(n => (n.textContent || '').trim() === 'Agendar cita');
-              if (!el) return false;
+              const normalize = (s) => (s || '').replace(/\s+/g, ' ').trim();
+              const nodes = Array.from(document.querySelectorAll('span, div, p, h1, h2, h3, h4, b, strong'));
+
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       style.opacity !== '0';
+              };
+
+              const el = nodes.find(n => normalize(n.innerText || n.textContent) === 'Agendar cita' && isVisible(n));
+              if (!el) {
+                return {ok: false, reason: 'visible text node not found'};
+              }
 
               let current = el;
-              let clicks = 0;
-              while (current && clicks < 8) {
-                current.dispatchEvent(new MouseEvent('click', {
-                  bubbles: true,
-                  cancelable: true,
-                  view: window
-                }));
+              for (let i = 0; current && i < 10; i++) {
+                const r = current.getBoundingClientRect();
+                // Buscar una tarjeta grande clickeable.
+                if (r.width >= 250 && r.height >= 120) {
+                  current.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: r.left + r.width / 2,
+                    clientY: r.top + r.height / 2
+                  }));
+                  current.click();
+                  return {ok: true, clicked: current.tagName, className: current.className || ''};
+                }
                 current = current.parentElement;
-                clicks++;
               }
-              return true;
+
+              el.click();
+              return {ok: true, clicked: el.tagName, className: el.className || ''};
             }
             """
         )
+        log(f"Resultado JS Agendar cita: {result}")
+        if not result or not result.get("ok"):
+            raise DianCheckerError(f"JS no encontró tarjeta visible: {result}")
 
-    attempts = [normal_click, card_mouse_click, js_ancestor_click]
+    def click_visible_text_locator():
+        log("Intentando click sobre texto visible Agendar cita")
+        locator = wait_visible_text(page, "Agendar cita", timeout=8_000)
+        locator.scroll_into_view_if_needed(timeout=5_000)
+        locator.click(force=True, timeout=5_000)
+
+    attempts = [
+        click_card_center,
+        click_plus_icon,
+        click_visible_text_parent_by_js,
+        click_visible_text_locator,
+    ]
+
     last_error = None
-
     for index, attempt in enumerate(attempts, start=1):
         try:
             log(f"Intento {index} para abrir Agendar cita")
             attempt()
-            esperar_pantalla_persona_natural(page, timeout=8_000)
-            log("Pantalla Persona Natural visible. Click Agendar cita funcionó.")
+            wait_persona_natural_after_click()
             return
         except Exception as e:
             last_error = e
@@ -158,7 +219,6 @@ def click_agendar_cita(page):
             screenshot(page, f"dian_agendar_intento_{index}.png")
 
     raise DianCheckerError(f"No se pudo pasar de Agendar cita. Último error: {repr(last_error)}")
-
 
 def aplicar_filtros(page):
     """

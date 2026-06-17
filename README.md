@@ -63,3 +63,8 @@ dian_error.png
 Ve a:
 
 `Actions` → `DIAN citas checker` → `Disable workflow`
+
+
+## v4
+
+Esta versión corrige el caso en el que `get_by_text("Agendar cita").first` apunta a un `<span>` oculto. Ahora intenta primero coordenadas sobre la tarjeta y usa una búsqueda que ignora nodos ocultos.
