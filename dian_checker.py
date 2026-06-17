@@ -33,20 +33,48 @@ def screenshot(page, name: str):
         log(f"No se pudo guardar screenshot {name}: {repr(e)}")
 
 
-def enviar_email():
-    email_from = os.environ["EMAIL_FROM"]
-    email_password = os.environ["EMAIL_PASSWORD"]
-    email_to = os.environ["EMAIL_TO"]
+def required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise DianCheckerError(f"El secret/variable {name} está vacío o no existe en GitHub Actions")
+    return value
 
-    body = (
-        "Posiblemente hay citas disponibles en la DIAN.\n\n"
-        "Entra manualmente a revisar y agendar:\n"
-        "https://agendamiento.dian.gov.co/\n\n"
-        f"Hora de detección: {now_colombia()}"
-    )
+
+def enviar_email(status: str):
+    email_from = required_env("EMAIL_FROM")
+    email_password = required_env("EMAIL_PASSWORD")
+    email_to = required_env("EMAIL_TO")
+
+    checked_at = now_colombia()
+
+    if status == "sin_citas":
+        subject = "DIAN: No hay citas disponibles 😢"
+        body = (
+            "No hay citas disponibles 😢\n\n"
+            "El bot revisó el agendamiento de citas de la DIAN y todavía aparece "
+            "el mensaje de no disponibilidad.\n\n"
+            "No tienes que hacer nada por ahora.\n\n"
+            f"Hora de revisión: {checked_at}\n"
+            "URL: https://agendamiento.dian.gov.co/"
+        )
+    elif status == "posible_disponibilidad":
+        subject = "DIAN: ¡Posible cita disponible! 🚨"
+        body = (
+            "Sí hay citas disponibles o ya no apareció el mensaje de no disponibilidad. 🚨\n\n"
+            "Entra rápido a revisar y agendar manualmente:\n"
+            "https://agendamiento.dian.gov.co/\n\n"
+            f"Hora de detección: {checked_at}"
+        )
+    else:
+        subject = "DIAN: Estado desconocido del bot ⚠️"
+        body = (
+            f"El bot terminó con un estado no esperado: {status} ⚠️\n\n"
+            f"Hora: {checked_at}\n"
+            "URL: https://agendamiento.dian.gov.co/"
+        )
 
     msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = "Posible cita disponible en la DIAN"
+    msg["Subject"] = subject
     msg["From"] = email_from
     msg["To"] = email_to
 
@@ -54,7 +82,7 @@ def enviar_email():
         server.login(email_from, email_password)
         server.send_message(msg)
 
-    log("Email enviado.")
+    log(f"Email enviado con subject: {subject}")
 
 
 def _find_text_info(page, fragment: str):
@@ -414,10 +442,11 @@ def revisar_dian() -> str:
 
 def main():
     status = revisar_dian()
-    if status == "posible_disponibilidad":
-        enviar_email()
-    else:
-        log("No se envía email porque no hay citas.")
+
+    # Enviar correo en ambos casos:
+    # - sin_citas: confirmación de que todavía no hay disponibilidad
+    # - posible_disponibilidad: alerta para entrar rápido
+    enviar_email(status)
 
 
 if __name__ == "__main__":

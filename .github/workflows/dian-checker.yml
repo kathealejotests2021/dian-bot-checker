@@ -30,6 +30,17 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      - name: Validate email secrets
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          test -n "$EMAIL_FROM" || (echo "EMAIL_FROM está vacío"; exit 1)
+          test -n "$EMAIL_PASSWORD" || (echo "EMAIL_PASSWORD está vacío"; exit 1)
+          test -n "$EMAIL_TO" || (echo "EMAIL_TO está vacío"; exit 1)
+          echo "Secrets de email cargados correctamente"
+
       - name: Check DIAN appointments
         env:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}

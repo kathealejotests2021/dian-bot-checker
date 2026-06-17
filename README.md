@@ -1,25 +1,35 @@
-# DIAN citas checker v6
+# DIAN citas checker v7
 
-Versión con espera real de la SPA antes de hacer click y clicks por fragmentos visibles, no por `get_by_text(...).first`.
+Bot temporal para revisar disponibilidad de citas en https://agendamiento.dian.gov.co/ usando GitHub Actions + Playwright.
 
-## Cambios principales
+## Qué hace esta versión
 
-- Espera a que aparezca `Agendar cita` o `Gestionar cita` antes de tomar screenshot/click.
-- Clicks por fragmento visible: `Agendar cita`, `Persona Natural`, `Videoatención`, `Devoluciones`.
-- Evita spans ocultos y contenedores gigantes.
-- Agrega logs `Dump visible matches` para diagnosticar qué elementos está viendo el runner.
-- Usa raw strings en JS para quitar warnings por `\s`.
+- Revisa el flujo de citas de la DIAN.
+- Envía correo **si no hay citas** con asunto: `DIAN: No hay citas disponibles 😢`.
+- Envía correo **si puede haber disponibilidad** con asunto: `DIAN: ¡Posible cita disponible! 🚨`.
+- Valida que los secrets de email no estén vacíos antes de ejecutar el bot.
+- Sube screenshots como artifact para depuración.
 
-## Secrets requeridos en GitHub Actions
+## Secrets requeridos
 
-Repository secrets:
+En GitHub:
 
-- `EMAIL_FROM`
-- `EMAIL_PASSWORD`
-- `EMAIL_TO`
+`Settings` → `Secrets and variables` → `Actions` → `New repository secret`
 
-## Ejecutar
+Crear estos 3 repository secrets:
 
-Sube los archivos al repo y ejecuta manualmente:
+```txt
+EMAIL_FROM
+EMAIL_PASSWORD
+EMAIL_TO
+```
 
-Actions → DIAN citas checker → Run workflow
+`EMAIL_PASSWORD` debe ser la contraseña de aplicación de Gmail de 16 dígitos, no la contraseña normal.
+
+## Probar manualmente
+
+`Actions` → `DIAN citas checker` → `Run workflow`
+
+## Apagar cuando consigas cita
+
+`Actions` → `DIAN citas checker` → `Disable workflow`
