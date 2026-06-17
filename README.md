@@ -1,55 +1,65 @@
-# DIAN Citas Checker
+# DIAN citas checker
 
-Bot temporal para revisar disponibilidad de citas en https://agendamiento.dian.gov.co/ usando GitHub Actions cada 20 minutos.
+Bot temporal para revisar disponibilidad de citas en https://agendamiento.dian.gov.co/ usando GitHub Actions + Playwright.
 
-## Archivos incluidos
+## Flujo configurado
 
-- `dian_checker.py`: script principal con Playwright.
-- `requirements.txt`: dependencias de Python.
-- `.github/workflows/dian-checker.yml`: workflow programado cada 20 minutos.
-- `.env.example`: ejemplo para pruebas locales.
+Según las capturas compartidas, el bot hace:
 
-## Configurar en GitHub
+1. `Agendar cita`
+2. `Persona Natural`
+3. `Videoatención`
+4. `Devoluciones.`
 
-1. Crea un repositorio en GitHub.
-2. Sube estos archivos al repositorio.
-3. Ve a `Settings` → `Secrets and variables` → `Actions` → `New repository secret`.
-4. Crea estos secrets:
+Después espera el mensaje:
 
-```txt
+```text
+No se encontraron especialidades relacionadas según los filtros seleccionados.
+```
+
+Si el mensaje aparece, asume que no hay citas. Si no aparece, envía un correo.
+
+## Secrets requeridos en GitHub
+
+En el repositorio:
+
+`Settings` → `Secrets and variables` → `Actions` → `New repository secret`
+
+Crea:
+
+```text
 EMAIL_FROM
 EMAIL_PASSWORD
 EMAIL_TO
 ```
 
-`EMAIL_PASSWORD` debe ser una contraseña de aplicación de Gmail, no tu contraseña normal.
+`EMAIL_PASSWORD` debe ser una contraseña de aplicación de Gmail, no la contraseña normal.
 
-## Probar manualmente
+## Ejecutar manualmente
 
 En GitHub:
 
 `Actions` → `DIAN citas checker` → `Run workflow`
 
-Si falla, revisa el artifact `dian-screenshots` para ver en qué pantalla quedó.
+## Programación
 
-## Ajustar filtros
+Corre cada 20 minutos entre 8:00 a. m. y 7:00 p. m. hora Colombia.
 
-Edita la función `aplicar_filtros()` en `dian_checker.py` si la DIAN te pide más campos después de:
+## Ver capturas si falla
 
-- Persona Natural
-- Videoatención
-- Devoluciones.
+Cada ejecución sube un artifact llamado `dian-screenshots` con capturas como:
 
-Puedes generar los selectores desde tu máquina con:
-
-```bash
-playwright codegen https://agendamiento.dian.gov.co/
+```text
+dian_01_inicio.png
+dian_02_agendar_cita.png
+dian_03_persona_natural.png
+dian_04_videoatencion.png
+dian_05_despues_devoluciones.png
+dian_error.png
 ```
 
-Luego copia los clicks/selects generados dentro de `aplicar_filtros()`.
+## Apagar cuando consigas la cita
 
-## Desactivar cuando consigas cita
-
-En GitHub:
+Ve a:
 
 `Actions` → `DIAN citas checker` → `Disable workflow`

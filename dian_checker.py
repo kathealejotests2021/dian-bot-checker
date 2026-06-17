@@ -1,4 +1,5 @@
 import os
+import re
 import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
@@ -6,9 +7,14 @@ from zoneinfo import ZoneInfo
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+
 DIAN_URL = "https://agendamiento.dian.gov.co/"
 NO_DISPONIBLE_TEXT = "No se encontraron especialidades relacionadas según los filtros seleccionados."
 APP_TIMEZONE = "America/Bogota"
+
+
+class DianCheckerError(Exception):
+    pass
 
 
 def now_colombia() -> str:
@@ -17,6 +23,14 @@ def now_colombia() -> str:
 
 def log(message: str):
     print(f"{now_colombia()} - {message}", flush=True)
+
+
+def screenshot(page, name: str):
+    try:
+        page.screenshot(path=name, full_page=True)
+        log(f"Screenshot guardado: {name}")
+    except Exception as e:
+        log(f"No se pudo guardar screenshot {name}: {repr(e)}")
 
 
 def enviar_email():
@@ -43,31 +57,59 @@ def enviar_email():
     log("Email enviado.")
 
 
-def click_text(page, text: str, timeout: int = 20_000):
+def wait_visible_text(page, text: str, exact: bool = True, timeout: int = 30_000):
+    locator = page.get_by_text(text, exact=exact).first
+    locator.wait_for(state="visible", timeout=timeout)
+    return locator
+
+
+def click_text(page, text: str, exact: bool = True, timeout: int = 30_000):
+    """
+    Click robusto por texto visible.
+    Si exact=True falla, intenta una búsqueda flexible con regex.
+    """
     log(f"Click en: {text}")
-    page.get_by_text(text, exact=True).first.click(timeout=timeout)
+
+    try:
+        locator = wait_visible_text(page, text, exact=exact, timeout=timeout)
+    except PlaywrightTimeoutError:
+        escaped = re.escape(text.replace(".", "")).replace("\\ ", r"\s+")
+        locator = page.get_by_text(re.compile(escaped, re.IGNORECASE)).first
+        locator.wait_for(state="visible", timeout=timeout)
+
+    locator.scroll_into_view_if_needed(timeout=timeout)
+    locator.click(timeout=timeout)
 
 
 def aplicar_filtros(page):
     """
-    Ajusta este flujo si la DIAN te pide más campos.
+    Flujo según las capturas compartidas:
 
-    Para obtener el flujo real desde tu máquina:
-        playwright codegen https://agendamiento.dian.gov.co/
+    1. Agendar cita
+    2. Persona Natural
+    3. Videoatención
+    4. Devoluciones.
 
-    Luego copias aquí los clicks/selects generados.
+    Si la DIAN cambia el texto o agrega campos adicionales, ajusta aquí.
     """
 
-    click_text(page, "Persona Natural")
-    click_text(page, "Videoatención")
-    click_text(page, "Devoluciones.")
+    screenshot(page, "dian_01_inicio.png")
 
-    # Si después aparecen más campos, agrégalos aquí.
-    # Ejemplos:
-    #
-    # page.get_by_label("Departamento").select_option("Bogotá")
-    # page.get_by_label("Ciudad").select_option("Bogotá D.C.")
-    # page.get_by_text("Continuar").click()
+    click_text(page, "Agendar cita")
+    wait_visible_text(page, "Persona Natural", timeout=40_000)
+    screenshot(page, "dian_02_agendar_cita.png")
+
+    click_text(page, "Persona Natural")
+    wait_visible_text(page, "Videoatención", timeout=30_000)
+    screenshot(page, "dian_03_persona_natural.png")
+
+    click_text(page, "Videoatención")
+    wait_visible_text(page, "Devoluciones.", exact=False, timeout=30_000)
+    screenshot(page, "dian_04_videoatencion.png")
+
+    # En algunos navegadores el punto final puede romper el exact match.
+    click_text(page, "Devoluciones.", exact=False)
+    screenshot(page, "dian_05_despues_devoluciones.png")
 
 
 def revisar_dian() -> str:
@@ -78,6 +120,7 @@ def revisar_dian() -> str:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--window-size=1366,900",
             ],
         )
 
@@ -96,11 +139,11 @@ def revisar_dian() -> str:
             try:
                 page.get_by_text(NO_DISPONIBLE_TEXT).wait_for(
                     state="visible",
-                    timeout=25_000,
+                    timeout=30_000,
                 )
 
                 log("Sin citas disponibles. Apareció el mensaje esperado.")
-                page.screenshot(path="dian_sin_citas.png", full_page=True)
+                screenshot(page, "dian_sin_citas.png")
                 return "sin_citas"
 
             except PlaywrightTimeoutError:
@@ -108,19 +151,16 @@ def revisar_dian() -> str:
 
                 if NO_DISPONIBLE_TEXT in body_text:
                     log("Sin citas disponibles. El texto apareció en el body.")
-                    page.screenshot(path="dian_sin_citas.png", full_page=True)
+                    screenshot(page, "dian_sin_citas.png")
                     return "sin_citas"
 
                 log("No apareció el mensaje de no disponibilidad. Posible cita disponible.")
-                page.screenshot(path="dian_posible_disponibilidad.png", full_page=True)
+                screenshot(page, "dian_posible_disponibilidad.png")
                 return "posible_disponibilidad"
 
         except Exception as e:
             log(f"Error revisando DIAN: {repr(e)}")
-            try:
-                page.screenshot(path="dian_error.png", full_page=True)
-            except Exception:
-                pass
+            screenshot(page, "dian_error.png")
             raise
 
         finally:
