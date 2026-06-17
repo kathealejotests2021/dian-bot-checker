@@ -4,11 +4,10 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Colombia es UTC-5.
-    # 13-23 UTC equivale a 08:00-18:40 Colombia.
-    - cron: "*/20 13-23 * * *"
+    # Cada 5 minutos de 08:00 a 18:55 Colombia
+    - cron: "*/5 13-23 * * *"
 
-    # 00:00 UTC equivale a 19:00 Colombia del día anterior.
+    # Última revisión a las 19:00 Colombia
     - cron: "0 0 * * *"
 
 jobs:
