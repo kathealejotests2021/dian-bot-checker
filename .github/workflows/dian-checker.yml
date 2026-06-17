@@ -2,8 +2,12 @@ name: DIAN citas checker
 
 on:
   workflow_dispatch:
+  
+  push:
+    branches:
+      - main
+      
   schedule:
-    # Se ejecuta cada 5 minutos, las 24 horas del día
     - cron: "*/5 * * * *"
 
 jobs:
