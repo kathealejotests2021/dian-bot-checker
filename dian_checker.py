@@ -63,22 +63,101 @@ def wait_visible_text(page, text: str, exact: bool = True, timeout: int = 30_000
     return locator
 
 
+def _flexible_text_locator(page, text: str):
+    escaped = re.escape(text.replace(".", "")).replace("\\ ", r"\s+")
+    return page.get_by_text(re.compile(escaped, re.IGNORECASE)).first
+
+
 def click_text(page, text: str, exact: bool = True, timeout: int = 30_000):
     """
     Click robusto por texto visible.
     Si exact=True falla, intenta una búsqueda flexible con regex.
     """
-    log(f"Click en: {text}")
+    log(f"Click en texto: {text}")
 
     try:
         locator = wait_visible_text(page, text, exact=exact, timeout=timeout)
     except PlaywrightTimeoutError:
-        escaped = re.escape(text.replace(".", "")).replace("\\ ", r"\s+")
-        locator = page.get_by_text(re.compile(escaped, re.IGNORECASE)).first
+        locator = _flexible_text_locator(page, text)
         locator.wait_for(state="visible", timeout=timeout)
 
     locator.scroll_into_view_if_needed(timeout=timeout)
     locator.click(timeout=timeout)
+
+
+def esperar_pantalla_persona_natural(page, timeout: int = 40_000):
+    wait_visible_text(page, "Persona Natural", timeout=timeout)
+
+
+def click_agendar_cita(page):
+    """
+    En la primera pantalla, el click directo sobre el texto 'Agendar cita'
+    a veces no dispara la navegación porque el listener está en la tarjeta.
+    Por eso se intenta:
+      1. Click normal sobre el texto.
+      2. Click en el centro aproximado de la tarjeta, calculado desde el texto.
+      3. Click JS sobre los ancestros del texto.
+    """
+    log("Click robusto en tarjeta: Agendar cita")
+
+    locator = wait_visible_text(page, "Agendar cita", timeout=40_000)
+    locator.scroll_into_view_if_needed(timeout=10_000)
+
+    def normal_click():
+        locator.click(timeout=10_000)
+
+    def card_mouse_click():
+        box = locator.bounding_box(timeout=10_000)
+        if not box:
+            raise DianCheckerError("No se pudo obtener bounding box de Agendar cita")
+
+        # En la tarjeta, el icono + está a la izquierda del texto. Un click allí
+        # suele disparar el evento de la tarjeta completa.
+        x = max(box["x"] - 120, 10)
+        y = box["y"] + 45
+        log(f"Click por coordenadas en tarjeta Agendar cita: x={x:.0f}, y={y:.0f}")
+        page.mouse.click(x, y)
+
+    def js_ancestor_click():
+        page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll('*'));
+              const el = nodes.find(n => (n.textContent || '').trim() === 'Agendar cita');
+              if (!el) return false;
+
+              let current = el;
+              let clicks = 0;
+              while (current && clicks < 8) {
+                current.dispatchEvent(new MouseEvent('click', {
+                  bubbles: true,
+                  cancelable: true,
+                  view: window
+                }));
+                current = current.parentElement;
+                clicks++;
+              }
+              return true;
+            }
+            """
+        )
+
+    attempts = [normal_click, card_mouse_click, js_ancestor_click]
+    last_error = None
+
+    for index, attempt in enumerate(attempts, start=1):
+        try:
+            log(f"Intento {index} para abrir Agendar cita")
+            attempt()
+            esperar_pantalla_persona_natural(page, timeout=8_000)
+            log("Pantalla Persona Natural visible. Click Agendar cita funcionó.")
+            return
+        except Exception as e:
+            last_error = e
+            log(f"Intento {index} no cambió de pantalla: {repr(e)}")
+            screenshot(page, f"dian_agendar_intento_{index}.png")
+
+    raise DianCheckerError(f"No se pudo pasar de Agendar cita. Último error: {repr(last_error)}")
 
 
 def aplicar_filtros(page):
@@ -95,8 +174,7 @@ def aplicar_filtros(page):
 
     screenshot(page, "dian_01_inicio.png")
 
-    click_text(page, "Agendar cita")
-    wait_visible_text(page, "Persona Natural", timeout=40_000)
+    click_agendar_cita(page)
     screenshot(page, "dian_02_agendar_cita.png")
 
     click_text(page, "Persona Natural")
