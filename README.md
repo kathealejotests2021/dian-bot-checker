@@ -1,21 +1,18 @@
-# DIAN citas checker v8 - Bogotá
+# DIAN citas checker v9
 
-Bot temporal para revisar el agendamiento de citas de la DIAN usando GitHub Actions + Playwright.
+Bot temporal para revisar disponibilidad de citas en https://agendamiento.dian.gov.co/ usando GitHub Actions + Playwright.
 
 ## Qué hace esta versión
 
-- Ejecuta el flujo:
-  1. Agendar cita
-  2. Persona Natural
-  3. Videoatención
-  4. Devoluciones
-  5. Trámite de devolución, si aparece
-- Ya no alerta solo por citas generales.
-- Revisa si en la pantalla final aparece `Bogotá` o `Bogota`.
+- Abre el flujo de agendamiento DIAN.
+- Selecciona `Agendar cita` → `Persona Natural` → `Videoatención` → `Devoluciones`.
+- Abre el checklist/dropdown del campo `Trámite`.
+- Busca `Bogotá`, `Bogota`, `bogotá` o `bogota` **solo dentro de ese checklist**, no en toda la página.
+- Esto evita falsos positivos causados por el footer de la DIAN, que también contiene la palabra Bogotá en la dirección.
 - Envía correo con:
   - `DIAN: ¡Hay citas en Bogotá! 🚨`
   - `DIAN: No hay citas en Bogotá 😢`
-- Guarda screenshots como artifact para depuración.
+- Sube screenshots como artifact para depuración.
 
 ## Secrets requeridos
 
@@ -37,9 +34,15 @@ EMAIL_TO
 
 `Actions` → `DIAN citas checker` → `Run workflow`
 
-## Nota sobre el schedule
+## Screenshot clave
 
-Si el `schedule` de GitHub no te funciona, deja solo `workflow_dispatch` y usa cron-job.org para disparar el workflow por API.
+La versión v9 genera:
+
+```txt
+dian_09_checklist_tramite_abierto.png
+```
+
+Ese screenshot debe mostrar el checklist/dropdown abierto. La decisión de Bogotá se toma únicamente con el texto de ese checklist.
 
 ## Apagar cuando consigas cita
 

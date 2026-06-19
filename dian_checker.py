@@ -379,11 +379,12 @@ def dump_visible_matches(page, label: str, fragments):
 
 
 
-def body_text_normalized(page) -> str:
-    """Texto visible normalizado para buscar Bogotá/Bogota sin depender del acento."""
-    text = page.locator("body").inner_text(timeout=15_000)
+
+def normalizar_texto(text: str) -> str:
+    """Normaliza acentos y mayúsculas para detectar Bogota/Bogotá/bogota/bogotá."""
     return (
-        text.lower()
+        (text or "")
+        .lower()
         .replace("á", "a")
         .replace("é", "e")
         .replace("í", "i")
@@ -393,66 +394,322 @@ def body_text_normalized(page) -> str:
     )
 
 
-def hay_bogota_en_pantalla(page) -> bool:
-    try:
-        text = body_text_normalized(page)
-        found = "bogota" in text
-        log(f"Detección Bogotá/Bogota en pantalla: {found}")
-        return found
-    except Exception as e:
-        log(f"No se pudo leer body para detectar Bogotá: {repr(e)}")
-        return False
+def contiene_bogota(text: str) -> bool:
+    return "bogota" in normalizar_texto(text)
 
 
-def click_tramite_devolucion_if_available(page, timeout: int = 12_000) -> bool:
+def abrir_checklist_tramite(page, timeout: int = 20_000) -> dict:
     """
-    En el paso de Devoluciones aparece el campo Trámite.
-    Si existe la opción visible 'Solicitud de devolución y/o compensación...', la selecciona.
-    Si no aparece, continúa sin fallar para no romper el bot.
+    Abre específicamente el checklist/dropdown del campo Trámite.
+
+    Importante: NO buscamos Bogotá en todo el body porque el footer de la DIAN
+    contiene Bogotá en la dirección principal y eso da falsos positivos.
     """
-    log("Intentando seleccionar trámite de devolución si aparece")
-    fragments = [
-        "Solicitud de devolución",
-        "devolución y/o compensación",
-        "compensación gran contribuyente",
-    ]
+    log("Abriendo checklist/dropdown del campo Trámite")
+    wait_text_fragment(page, "Trámite", timeout=timeout)
 
     deadline = time.monotonic() + timeout / 1000
-    while time.monotonic() < deadline:
-        try:
-            for fragment in fragments:
-                info = _find_text_info(page, fragment)
-                if info and info.get("count", 0) > 0:
-                    log(f"Trámite detectado por fragmento: {fragment}")
-                    click_by_fragment(page, fragment, timeout=5_000, prefer_card=False)
-                    page.wait_for_timeout(1200)
-                    screenshot(page, "dian_08_tramite_devolucion_click.png")
-                    return True
-        except Exception as e:
-            log(f"Intento de selección de trámite no exitoso todavía: {repr(e)}")
-        time.sleep(0.5)
+    last = None
 
-    log("No se encontró el trámite de devolución; se continúa sin seleccionarlo")
-    return False
+    while time.monotonic() < deadline:
+        result = page.evaluate(
+            r"""
+            () => {
+              const normalize = (s) => (s || '')
+                .replace(/[.]/g, '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+
+              const isVisible = (el) => {
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                return r.width > 0 && r.height > 0 &&
+                       style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       style.opacity !== '0';
+              };
+
+              const clickElement = (target) => {
+                target.scrollIntoView({block: 'center', inline: 'center'});
+                const r = target.getBoundingClientRect();
+                const x = r.left + r.width / 2;
+                const y = r.top + r.height / 2;
+                const events = ['pointerover', 'mouseover', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'];
+                for (const type of events) {
+                  target.dispatchEvent(new MouseEvent(type, {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: x,
+                    clientY: y
+                  }));
+                }
+                if (typeof target.click === 'function') target.click();
+                return {
+                  x: Math.round(x),
+                  y: Math.round(y),
+                  width: Math.round(r.width),
+                  height: Math.round(r.height),
+                  tag: target.tagName,
+                  className: (target.className || '').toString().slice(0, 120),
+                  text: normalize(target.innerText || target.textContent || '').slice(0, 160)
+                };
+              };
+
+              const nodes = Array.from(document.querySelectorAll('body *')).filter(isVisible);
+
+              // Buscar el label visible "Trámite".
+              const labels = nodes
+                .filter(el => normalize(el.innerText || el.textContent || '') === 'tramite')
+                .map(el => ({el, r: el.getBoundingClientRect()}))
+                .sort((a, b) => (a.r.top - b.r.top) || (a.r.left - b.r.left));
+
+              if (!labels.length) {
+                return {ok: false, reason: 'label_tramite_not_found'};
+              }
+
+              const label = labels[labels.length - 1];
+              const lr = label.r;
+
+              // El campo real suele estar justo debajo del label y puede ser un ng-select,
+              // un div con role combobox, un input readonly, etc.
+              const candidates = nodes
+                .map(el => ({el, r: el.getBoundingClientRect(), text: normalize(el.innerText || el.textContent || '')}))
+                .filter(({el, r, text}) => {
+                  const tag = el.tagName;
+                  const cls = (el.className || '').toString().toLowerCase();
+                  const role = (el.getAttribute('role') || '').toLowerCase();
+                  const area = r.width * r.height;
+
+                  if (r.top < lr.bottom - 5 || r.top > lr.bottom + 120) return false;
+                  if (r.width < 180 || r.width > 900) return false;
+                  if (r.height < 20 || r.height > 90) return false;
+                  if (area <= 0 || area > 90000) return false;
+
+                  // Debe estar más o menos alineado con el label/campo de trámite.
+                  const horizontalOverlap = Math.min(r.right, lr.left + 900) - Math.max(r.left, lr.left - 20);
+                  if (horizontalOverlap < 80) return false;
+
+                  return tag === 'INPUT' || tag === 'SELECT' || tag === 'BUTTON' ||
+                         role === 'combobox' || role === 'listbox' || role === 'button' ||
+                         cls.includes('select') || cls.includes('dropdown') ||
+                         cls.includes('input') || cls.includes('control') ||
+                         cls.includes('ng-') || cls.includes('form');
+                })
+                .sort((a, b) => {
+                  // Preferir el control ancho y más cercano debajo de Trámite.
+                  const dy = Math.abs(a.r.top - lr.bottom) - Math.abs(b.r.top - lr.bottom);
+                  if (dy !== 0) return dy;
+                  return (b.r.width * b.r.height) - (a.r.width * a.r.height);
+                });
+
+              let target = null;
+              if (candidates.length) {
+                target = candidates[0].el;
+              } else {
+                // Fallback por coordenadas: click en el centro aproximado del campo debajo de Trámite.
+                const x = lr.left + 260;
+                const y = lr.bottom + 38;
+                target = document.elementFromPoint(x, y);
+                if (!target) {
+                  return {ok: false, reason: 'fallback_element_from_point_not_found', x: Math.round(x), y: Math.round(y)};
+                }
+              }
+
+              const clicked = clickElement(target);
+              return {ok: true, clicked, label: {x: Math.round(lr.left), y: Math.round(lr.top), width: Math.round(lr.width), height: Math.round(lr.height)}};
+            }
+            """
+        )
+        last = result
+        log(f"Resultado abrir checklist Trámite: {result}")
+        page.wait_for_timeout(1200)
+
+        texts = extraer_textos_checklist_abierto(page)
+        if texts:
+            return {"ok": True, "opened": result, "texts": texts}
+
+        time.sleep(0.6)
+
+    raise DianCheckerError(f"No se pudo abrir/leer el checklist del campo Trámite. Último resultado: {last}")
+
+
+def extraer_textos_checklist_abierto(page) -> list[str]:
+    """
+    Extrae texto SOLO del dropdown/checklist abierto, no del body completo.
+    Filtra el footer para evitar el falso positivo de la dirección de la DIAN en Bogotá.
+    """
+    result = page.evaluate(
+        r"""
+        () => {
+          const normalizeSpaces = (s) => (s || '').replace(/\s+/g, ' ').trim();
+          const normalize = (s) => normalizeSpaces(s).toLowerCase();
+          const isVisible = (el) => {
+            const r = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return r.width > 0 && r.height > 0 &&
+                   style.display !== 'none' &&
+                   style.visibility !== 'hidden' &&
+                   style.opacity !== '0';
+          };
+          const isFooterText = (text) => {
+            const t = normalize(text);
+            return t.includes('dirección de impuestos y aduanas nacionales') ||
+                   t.includes('contact center') ||
+                   t.includes('política de seguridad') ||
+                   t.includes('notificaciones judiciales') ||
+                   t.includes('mapa del sitio') ||
+                   t.includes('política de tratamiento de datos');
+          };
+
+          const all = Array.from(document.querySelectorAll('body *')).filter(isVisible);
+
+          // Recalcular el rect del campo Trámite para limitar la búsqueda a su dropdown.
+          const labels = all
+            .filter(el => normalize(el.innerText || el.textContent || '').replace(/[.]/g, '') === 'tramite')
+            .map(el => ({el, r: el.getBoundingClientRect()}))
+            .sort((a, b) => (a.r.top - b.r.top) || (a.r.left - b.r.left));
+          const labelRect = labels.length ? labels[labels.length - 1].r : null;
+
+          const semanticSelectors = [
+            '[role="listbox"]',
+            '[role="menu"]',
+            '[role="option"]',
+            '.ng-dropdown-panel',
+            '.ng-dropdown-panel-items',
+            '.ng-option',
+            '.dropdown-menu',
+            '.dropdown-content',
+            '.select-dropdown',
+            '.select-options',
+            '.mat-select-panel',
+            '.mat-option',
+            '.cdk-overlay-pane',
+            '.p-dropdown-panel',
+            '.p-dropdown-items',
+            '.p-dropdown-item',
+            '.multiselect-dropdown',
+            '.options',
+            '.option'
+          ].join(',');
+
+          const semantic = Array.from(document.querySelectorAll(semanticSelectors))
+            .filter(isVisible)
+            .map(el => ({el, r: el.getBoundingClientRect(), source: 'semantic'}));
+
+          const geometric = [];
+          if (labelRect) {
+            for (const el of all) {
+              const r = el.getBoundingClientRect();
+              const text = normalizeSpaces(el.innerText || el.textContent || '');
+              if (!text) continue;
+              if (isFooterText(text)) continue;
+
+              const area = r.width * r.height;
+              if (area <= 0 || area > 260000) continue;
+              if (r.width < 120 || r.height < 16) continue;
+
+              // Dropdown/lista debe estar cerca del campo Trámite, no en todo el documento.
+              const belowTramite = r.top >= labelRect.bottom - 10 && r.top <= labelRect.bottom + 260;
+              const overlapsHorizontally = Math.min(r.right, labelRect.left + 900) - Math.max(r.left, labelRect.left - 30) > 80;
+
+              if (belowTramite && overlapsHorizontally) {
+                geometric.push({el, r, source: 'geometric'});
+              }
+            }
+          }
+
+          const rawCandidates = semantic.concat(geometric);
+          const seen = new Set();
+          const candidates = [];
+
+          for (const {el, r, source} of rawCandidates) {
+            const text = normalizeSpaces(el.innerText || el.textContent || '');
+            if (!text || text.length < 2) continue;
+            if (isFooterText(text)) continue;
+
+            const tag = el.tagName;
+            if (['BODY', 'HTML', 'APP-ROOT', 'FOOTER'].includes(tag)) continue;
+
+            const key = text + '|' + Math.round(r.left) + '|' + Math.round(r.top) + '|' + Math.round(r.width) + '|' + Math.round(r.height);
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            candidates.push({
+              text,
+              source,
+              tag,
+              x: Math.round(r.left),
+              y: Math.round(r.top),
+              width: Math.round(r.width),
+              height: Math.round(r.height),
+              className: (el.className || '').toString().slice(0, 120)
+            });
+          }
+
+          // Preferir textos más específicos, no contenedores gigantes duplicados.
+          candidates.sort((a, b) => (a.text.length - b.text.length) || (a.y - b.y));
+
+          return candidates.slice(0, 20);
+        }
+        """
+    )
+
+    texts = []
+    for item in result or []:
+        text = (item.get("text") or "").strip()
+        if text and text not in texts:
+            texts.append(text)
+
+    log(f"Textos detectados dentro del checklist/dropdown Trámite: {texts}")
+    return texts
+
+
+def detectar_bogota_en_checklist_tramite(page) -> bool:
+    """
+    Regla corregida:
+    - Abrir el checklist/dropdown del campo Trámite.
+    - Buscar Bogotá/Bogota/bogota/bogotá únicamente dentro de esa lista visible.
+    - NO buscar en el body completo porque el footer tiene la palabra Bogotá.
+    """
+    try:
+        info = abrir_checklist_tramite(page, timeout=20_000)
+        texts = info.get("texts", [])
+        screenshot(page, "dian_09_checklist_tramite_abierto.png")
+
+        checklist_text = "\n".join(texts)
+        found = contiene_bogota(checklist_text)
+        log(f"Detección Bogotá/Bogota SOLO en checklist de Trámite: {found}")
+        log(f"Contenido del checklist evaluado: {checklist_text!r}")
+        return found
+    except Exception as e:
+        log(f"No se pudo evaluar Bogotá dentro del checklist de Trámite: {repr(e)}")
+        screenshot(page, "dian_09_checklist_tramite_error.png")
+        return False
 
 
 def avanzar_hasta_pantalla_disponibilidad(page):
     """
-    Luego de seleccionar Devoluciones, intenta seleccionar el trámite y avanzar.
-    La DIAN puede cambiar la UI; por eso cada paso es tolerante.
+    Antes esta función seleccionaba el trámite y luego buscaba Bogotá en toda la pantalla.
+    Eso estaba mal porque el footer contiene Bogotá.
+
+    Ahora solo abre el checklist/dropdown de Trámite y deja la lista visible para que
+    evaluar_disponibilidad_bogota() busque Bogotá únicamente dentro del checklist.
     """
-    click_tramite_devolucion_if_available(page, timeout=12_000)
-    click_siguiente_if_available(page, timeout=8_000)
-    page.wait_for_timeout(2500)
-    screenshot(page, "dian_09_pantalla_disponibilidad_bogota.png")
+    page.wait_for_timeout(1200)
+    try:
+        abrir_checklist_tramite(page, timeout=20_000)
+    except Exception as e:
+        log(f"No se pudo abrir checklist todavía: {repr(e)}")
+    screenshot(page, "dian_09_checklist_tramite_abierto.png")
 
 
 def evaluar_disponibilidad_bogota(page) -> str:
     """
     Regla actual solicitada:
-    - Si en la pantalla aparece Bogotá/Bogota => bogota_disponible.
-    - Si no aparece Bogotá/Bogota => sin_bogota.
-    - Si aparece el modal genérico de no disponibilidad => sin_bogota.
+    - Si el checklist/dropdown abierto contiene Bogotá/Bogota/bogota/bogotá => bogota_disponible.
+    - Si no contiene Bogotá dentro de ese checklist => sin_bogota.
     """
     try:
         body_text = page.locator("body").inner_text(timeout=15_000)
@@ -464,12 +721,12 @@ def evaluar_disponibilidad_bogota(page) -> str:
         screenshot(page, "dian_sin_bogota.png")
         return "sin_bogota"
 
-    if hay_bogota_en_pantalla(page):
-        log("Bogotá detectada en la pantalla. Hay disponibilidad en Bogotá.")
+    if detectar_bogota_en_checklist_tramite(page):
+        log("Bogotá detectada dentro del checklist de Trámite. Hay disponibilidad en Bogotá.")
         screenshot(page, "dian_bogota_disponible.png")
         return "bogota_disponible"
 
-    log("No se detectó Bogotá en la pantalla. Se reporta sin citas en Bogotá.")
+    log("No se detectó Bogotá dentro del checklist de Trámite. Se reporta sin citas en Bogotá.")
     screenshot(page, "dian_sin_bogota.png")
     return "sin_bogota"
 
