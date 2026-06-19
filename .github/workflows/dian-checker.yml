@@ -2,16 +2,16 @@ name: DIAN citas checker
 
 on:
   workflow_dispatch:
-  
+
   push:
     branches:
       - main
-      
 
 jobs:
   check-dian:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4

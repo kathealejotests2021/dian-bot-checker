@@ -47,21 +47,39 @@ def enviar_email(status: str):
 
     checked_at = now_colombia()
 
-    if status == "sin_citas":
+    if status == "bogota_disponible":
+        subject = "DIAN: ¡Hay citas en Bogotá! 🚨"
+        body = (
+            "Sí hay citas disponibles en Bogotá. 🚨\n\n"
+            "Entra rápido a revisar y agendar manualmente:\n"
+            "https://agendamiento.dian.gov.co/\n\n"
+            f"Hora de detección: {checked_at}"
+        )
+    elif status == "sin_bogota":
+        subject = "DIAN: No hay citas en Bogotá 😢"
+        body = (
+            "No hay citas disponibles en Bogotá 😢\n\n"
+            "El bot encontró el flujo de Devoluciones, pero no encontró la palabra "
+            "Bogotá/Bogota en la pantalla de disponibilidad. Puede que haya citas "
+            "en otras ciudades, pero no en Bogotá.\n\n"
+            f"Hora de revisión: {checked_at}\n"
+            "URL: https://agendamiento.dian.gov.co/"
+        )
+    elif status == "sin_citas":
         subject = "DIAN: No hay citas disponibles 😢"
         body = (
             "No hay citas disponibles 😢\n\n"
             "El bot revisó el agendamiento de citas de la DIAN y todavía aparece "
             "el mensaje de no disponibilidad.\n\n"
-            "No tienes que hacer nada por ahora.\n\n"
             f"Hora de revisión: {checked_at}\n"
             "URL: https://agendamiento.dian.gov.co/"
         )
     elif status == "posible_disponibilidad":
-        subject = "DIAN: ¡Posible cita disponible! 🚨"
+        subject = "DIAN: Hay citas, pero no se confirmó Bogotá ⚠️"
         body = (
-            "Sí hay citas disponibles o ya no apareció el mensaje de no disponibilidad. 🚨\n\n"
-            "Entra rápido a revisar y agendar manualmente:\n"
+            "El bot detectó que puede haber disponibilidad, pero no logró confirmar "
+            "que exista Bogotá en la pantalla. ⚠️\n\n"
+            "Revisa manualmente:\n"
             "https://agendamiento.dian.gov.co/\n\n"
             f"Hora de detección: {checked_at}"
         )
@@ -83,7 +101,6 @@ def enviar_email(status: str):
         server.send_message(msg)
 
     log(f"Email enviado con subject: {subject}")
-
 
 def _find_text_info(page, fragment: str):
     return page.evaluate(
@@ -361,6 +378,101 @@ def dump_visible_matches(page, label: str, fragments):
             log(f"No se pudo inspeccionar fragmento {fragment}: {repr(e)}")
 
 
+
+def body_text_normalized(page) -> str:
+    """Texto visible normalizado para buscar Bogotá/Bogota sin depender del acento."""
+    text = page.locator("body").inner_text(timeout=15_000)
+    return (
+        text.lower()
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("ü", "u")
+    )
+
+
+def hay_bogota_en_pantalla(page) -> bool:
+    try:
+        text = body_text_normalized(page)
+        found = "bogota" in text
+        log(f"Detección Bogotá/Bogota en pantalla: {found}")
+        return found
+    except Exception as e:
+        log(f"No se pudo leer body para detectar Bogotá: {repr(e)}")
+        return False
+
+
+def click_tramite_devolucion_if_available(page, timeout: int = 12_000) -> bool:
+    """
+    En el paso de Devoluciones aparece el campo Trámite.
+    Si existe la opción visible 'Solicitud de devolución y/o compensación...', la selecciona.
+    Si no aparece, continúa sin fallar para no romper el bot.
+    """
+    log("Intentando seleccionar trámite de devolución si aparece")
+    fragments = [
+        "Solicitud de devolución",
+        "devolución y/o compensación",
+        "compensación gran contribuyente",
+    ]
+
+    deadline = time.monotonic() + timeout / 1000
+    while time.monotonic() < deadline:
+        try:
+            for fragment in fragments:
+                info = _find_text_info(page, fragment)
+                if info and info.get("count", 0) > 0:
+                    log(f"Trámite detectado por fragmento: {fragment}")
+                    click_by_fragment(page, fragment, timeout=5_000, prefer_card=False)
+                    page.wait_for_timeout(1200)
+                    screenshot(page, "dian_08_tramite_devolucion_click.png")
+                    return True
+        except Exception as e:
+            log(f"Intento de selección de trámite no exitoso todavía: {repr(e)}")
+        time.sleep(0.5)
+
+    log("No se encontró el trámite de devolución; se continúa sin seleccionarlo")
+    return False
+
+
+def avanzar_hasta_pantalla_disponibilidad(page):
+    """
+    Luego de seleccionar Devoluciones, intenta seleccionar el trámite y avanzar.
+    La DIAN puede cambiar la UI; por eso cada paso es tolerante.
+    """
+    click_tramite_devolucion_if_available(page, timeout=12_000)
+    click_siguiente_if_available(page, timeout=8_000)
+    page.wait_for_timeout(2500)
+    screenshot(page, "dian_09_pantalla_disponibilidad_bogota.png")
+
+
+def evaluar_disponibilidad_bogota(page) -> str:
+    """
+    Regla actual solicitada:
+    - Si en la pantalla aparece Bogotá/Bogota => bogota_disponible.
+    - Si no aparece Bogotá/Bogota => sin_bogota.
+    - Si aparece el modal genérico de no disponibilidad => sin_bogota.
+    """
+    try:
+        body_text = page.locator("body").inner_text(timeout=15_000)
+    except Exception:
+        body_text = ""
+
+    if NO_DISPONIBLE_TEXT in body_text:
+        log("Apareció mensaje genérico de no disponibilidad; se reporta sin Bogotá.")
+        screenshot(page, "dian_sin_bogota.png")
+        return "sin_bogota"
+
+    if hay_bogota_en_pantalla(page):
+        log("Bogotá detectada en la pantalla. Hay disponibilidad en Bogotá.")
+        screenshot(page, "dian_bogota_disponible.png")
+        return "bogota_disponible"
+
+    log("No se detectó Bogotá en la pantalla. Se reporta sin citas en Bogotá.")
+    screenshot(page, "dian_sin_bogota.png")
+    return "sin_bogota"
+
 def aplicar_filtros(page):
     # La página es SPA: domcontentloaded ocurre antes de que cargue la UI real.
     # Por eso primero esperamos la pantalla inicial y solo después tomamos screenshot/click.
@@ -388,8 +500,7 @@ def aplicar_filtros(page):
 
     click_by_fragment(page, "Devoluciones", timeout=30_000, prefer_card=True)
     screenshot(page, "dian_07_devoluciones_click.png")
-    click_siguiente_if_available(page, timeout=8_000)
-    screenshot(page, "dian_08_despues_devoluciones.png")
+    avanzar_hasta_pantalla_disponibilidad(page)
 
 
 def revisar_dian() -> str:
@@ -416,21 +527,9 @@ def revisar_dian() -> str:
 
             aplicar_filtros(page)
 
-            try:
-                page.get_by_text(NO_DISPONIBLE_TEXT).wait_for(state="visible", timeout=30_000)
-                log("Sin citas disponibles. Apareció el mensaje esperado.")
-                screenshot(page, "dian_sin_citas.png")
-                return "sin_citas"
-            except PlaywrightTimeoutError:
-                body_text = page.locator("body").inner_text(timeout=10_000)
-                if NO_DISPONIBLE_TEXT in body_text:
-                    log("Sin citas disponibles. El texto apareció en el body.")
-                    screenshot(page, "dian_sin_citas.png")
-                    return "sin_citas"
-
-                log("No apareció el mensaje de no disponibilidad. Posible cita disponible.")
-                screenshot(page, "dian_posible_disponibilidad.png")
-                return "posible_disponibilidad"
+            # Ahora no basta con saber si hay citas en general.
+            # La regla nueva es: alertar solo si aparece Bogotá/Bogota en pantalla.
+            return evaluar_disponibilidad_bogota(page)
 
         except Exception as e:
             log(f"Error revisando DIAN: {repr(e)}")
